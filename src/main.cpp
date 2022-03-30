@@ -1,5 +1,13 @@
+/*
 
-//#include <Arduino.h>
+Ensinmäinen testikoodi laitteistoa ohjaamaan ja toimintoja testaamaan. 
+
+Seuraavaksi tehdään akusta olio.
+
+*/
+
+
+#include <Arduino.h>
 #include <Adafruit_ADS1X15.h>
 #include <QuickPID.h>
 #include <BluetoothSerial.h>
@@ -12,8 +20,8 @@
 #error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
 #endif
 
-const char* ssid = "OpenWrt";
-const char* password = "10209997";
+const char* ssid = "xxxx";
+const char* password = "xxxx";
 
 #define HEATER 23
 #define CHARGER 22
