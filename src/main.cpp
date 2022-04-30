@@ -27,11 +27,18 @@ IPAddress dns(8, 8, 8, 8);
 #define AKKULAMPO_LM35 "akku/lampoLM35"
 #define AKKULAMPOTEHOT "akku/tehot"
 #define LAMPOKATKAISU "akku/lamposw"
+#define AKKU_BOOST "akku/boost_sw"
+#define LAMMTOT "akku/lamm_tot"
+#define UPTIMES "akku/uptimes"
+#define BOOSTSENSE "akku/boostsens"
+#define KP "akku/kp"
+#define KI "akku/ki"
+
 #define uS_TO_S_FACTOR 1000000ULL  /* Conversion factor for micro seconds to seconds */
 #define TIME_TO_SLEEP  60 /* Time ESP32 will go to sleep (in seconds) */
 
-#define HEATER 13
-#define CHARGER 12
+#define HEATER 13     //GPIO13 = D7
+#define CHARGER 12    //GPIO12 = D6
 #define WDT_TIMEOUT 60          // Watchdog timeout 60 sekunttia
 #define SDAPIN 4
 #define SCLPIN 5
@@ -41,7 +48,20 @@ bool printOrPlotter = 0;  // on(1) monitor, off(0) plotter
 float POn = 1.0;          // proportional on Error to Measurement ratio (0.0-1.0), default = 1.0
 float DOn = 0.0;          // derivative on Error to Measurement ratio (0.0-1.0), default = 0.0
 float Setpoint, Input, Output;
-float Kp = 2, Ki = 5, Kd = 1;
+float Kp = 0.5, Ki = 0.005, Kd = 0;  // edellinen: P=0.01, I=0.05 
+float lammitys_tot;
+
+float janniteviesti;
+float NTC_viesti;  
+float LM35_viesti;
+float bttpwr_viesti;
+float heatsw_viesti;
+float boost_viesti;
+float lammtot_viesti;
+float millis_viesti;
+float bsense_viesti;
+float kp_viesti;
+float ki_viesti;
 
 // kirjastot
 WiFiClient espClient;
@@ -51,28 +71,30 @@ QuickPID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd,
                myPID.pMode::pOnError,
                myPID.dMode::dOnMeas,
                myPID.iAwMode::iAwClamp,
-               myPID.Action::reverse);
-
-
-
+               myPID.Action::direct);
 
 // ADC muuttujat
 int16_t adc0, adc1, adc2, adc3;
-float volts0, volts1, volts2, volts3;
+float volts0, volts1, volts2, volts3, akunjannite;
 int16_t mapval;
 int16_t mapvalinv; 
+
 
 
 //check? -delete
 unsigned long lastmillis = 0;
 unsigned long prevmillis = 0;
 unsigned long lampoMillis = 0;
+unsigned long mittausmillit = 0;
 unsigned long interval = 30000;
 
 // ohjelman määrityksiä nolliin. Alustusta.
 float ntc1tmp = 0;
 float NewSetpoint = 0;
 int LampoKatkaisu = 1;
+int akku_boost = 0;
+float millisek;
+int akkuboostsensor = 0;
 
 //MQTT tallennuksia aikavertailuja.
 long lastMsg = 0;
@@ -81,17 +103,74 @@ char lm35_msg[20];
 char v_msg[20];
 char bttpwr_msg[20];
 char heatsw_msg[20];
+char boost_msg[20];
+char lammtotmsg[20];
+char ms_msg[20];
+char boostsens_msg[20];
+char kp_msg[20];
+char ki_msg[20];
+
+
 
 
 void receivedCallback(char* topic, byte* payload, unsigned int length) {
+  
   Serial.print("Message received: ");
   Serial.println(topic);
+  String topicstr = topic;
+  String Lasti = String(( char *) payload); 
+  Serial.println("String payload: ");
+  Serial.print(topicstr);
+  Serial.print("  ");
+  Serial.print(Lasti);
+  
+  if(topicstr == AKKU_BOOST )
+      {
+      if(payload[0] == 49) // ASCII: 49 = 1, 48 = 0
+      {
+      akku_boost = 1;
+      Serial.println(payload[0]);
+      Serial.println("Boost on päällä");
+      }
+    if(payload[0] == 48)
+      {
+      akku_boost = 0;
+      Serial.println("Boost on pois päältä");
+      Serial.println(payload[0]);
+      }
+    // Serial.print(" akunboost_looppi");
+    // Serial.println(payload[0]);
+  }
 
-  Serial.print("payload: ");
-  for (int i = 0; i < length; i++) {
+  if(topic == KP)
+    {
+        Serial.print("Kp was: ");
+        Serial.print(Kp);
+        Kp = Lasti.toFloat();
+        Serial.print("Kp is now: ");
+        Serial.print(Kp);
+    }
+
+  if(topic == KI)
+    {
+        Serial.print("Ki was: ");
+        Serial.print(Ki);
+        Ki = Lasti.toFloat();
+        Serial.print("Ki is now: ");
+        Serial.print(Ki);
+    }
+
+  
+  Serial.print("char payload: ");
+  for (int i = 0; i < length; i++) 
+    {
     Serial.print((char)payload[i]);
     }
+   
   Serial.println(" ");
+
+
+
 }
 
 // MQTT yhdistys funktio.
@@ -111,6 +190,12 @@ void mqttconnect() {
       client.subscribe(AKKULAMPO_LM35);
       client.subscribe(AKKULAMPOTEHOT);
       client.subscribe(LAMPOKATKAISU);
+      client.subscribe(AKKU_BOOST);
+      client.subscribe(LAMMTOT);
+      client.subscribe(UPTIMES);
+      client.subscribe(BOOSTSENSE);
+      client.subscribe(KP);
+      client.subscribe(KI);
       } else {
       Serial.print("failed, status code =");
       Serial.print(client.state());
@@ -121,47 +206,6 @@ void mqttconnect() {
   }
 }
 
-float ADC_luku()
-{
-  if (lastmillis - prevmillis >= 10000)
-    {
-      prevmillis = lastmillis;
-
-      adc0 = ads.readADC_SingleEnded(0);  // NTC vastus 10/10 jännitejako. 20kOhm = 25C, 38kOhm=0C B=3977,3455 ehkä.  
-      adc1 = ads.readADC_SingleEnded(1);  // NTV vastus. (1. sensori => 0C=32 kOhm/28 kOhm, 100C=0.9kOhm) B=36390
-      adc2 = ads.readADC_SingleEnded(2);  // LM35 :n lämpömittaus
-      adc3 = ads.readADC_SingleEnded(3);  // Jännitteenmittaus 3.3k/100k = Gain1(4.096V), max=127.5V, resolution=0.125mV. 
-
-      volts0 = ads.computeVolts(adc0);
-      volts1 = ads.computeVolts(adc1);
-      volts2 = ads.computeVolts(adc2) * 100;    // lm35= 10mV/C 
-      volts3 = ads.computeVolts(adc3) * 31.31;  // jännitteenjaon korjauskerroin
-
-      Serial.println("-----------------------------------------------------------");
-      Serial.print("AIN0: "); Serial.print(adc0); Serial.print("  "); Serial.print(volts0); Serial.println("V");
-      Serial.print("AIN1: "); Serial.print(adc1); Serial.print("  "); Serial.print(volts1); Serial.println("V");
-      Serial.print("AIN2: "); Serial.print(adc2); Serial.print("  "); Serial.print(volts2); Serial.println(" 'C");
-      Serial.print("AIN3: "); Serial.print(adc3); Serial.print("  "); Serial.print(volts3); Serial.println("V");
-      Serial.print("Setpoint: "); Serial.print(Setpoint); Serial.print("  "); Serial.println(" 'C");
-      //Serial.print("Output0: "); Serial.print(tehot); Serial.print("  "); Serial.println(" ms");
-
-
-
-    }
-
-
-return volts3;
-}
-
-// akun lukufunktio ADC:ltä.
-float battery_read()
-{
-
-    uint32_t voltage = ADC_luku();
-
-    return voltage;
-   
-    }
 
 void setup()
 {
@@ -170,12 +214,12 @@ void setup()
 
   pinMode(HEATER, OUTPUT);                  // Lämmitinvastuksen ohjauspinni
   pinMode(CHARGER, OUTPUT);                  // Laturin rele AC
-  Wire.begin(SDAPIN,SCLPIN);                    // i2c pinnit ADS1115:lle
+  Wire.begin(SDAPIN, SCLPIN);                    // i2c pinnit ADS1115:lle
+
 
 
   // QuickPID
-  Input = volts1;
-  Setpoint = 2; 
+  Setpoint = 24; 
   myPID.SetTunings(Kp, Ki, Kd); //apply PID gains
   myPID.SetMode(myPID.Control::automatic);   //turn the PID on
 
@@ -229,16 +273,110 @@ void setup()
 
 void loop()
 {
-  lastmillis = millis();
 
- volts1 = Input = ads.computeVolts(ads.readADC_SingleEnded(2));
-  // Serial.print("Input: ");
-  // Serial.println(Input);
-  //volts1 = Input; 
+lastmillis = millis();
 
-  myPID.Compute();    // PID laskenta.
+  if(lastmillis - mittausmillit >= 1000)
+    {
+      mittausmillit = lastmillis;
+      volts1 = ads.computeVolts(ads.readADC_SingleEnded(2));
+      Input = ads.computeVolts(ads.readADC_SingleEnded(0)) * 100;
+      akunjannite = ads.computeVolts(ads.readADC_SingleEnded(3)) * 31.8;
+    }
+ 
+  myPID.Compute();    // PID laskenta. Output = 8 Bit.
+  
+  //---------------------------------
+  //  HUOMIO::HUOMIO::HUOMIO::HUOMIO
+  //
+  // HUOM: volts1 on invertoitu! 
+  // 
+  //  HUOMIO::HUOMIO::HUOMIO::HUOMIO
+  //----------------------------------
 
-  /*
+  if( volts1 >= 1.2 && akunjannite >= 50)  // estetään lämpeneminen liian kuumana ja liian matalassa jännitteessä.
+  {
+    analogWrite(HEATER, Output);
+    lammitys_tot=1;
+  }
+  else
+    lammitys_tot=0;
+
+   // Jos käydään lämpörajoilla, katkaistaan laturin virta. 
+  if( volts1 < 1.4 || volts1 >  3.53 )  // 3.533=5C, 1.5=47C, 1.78=40C
+    { 
+      digitalWrite(CHARGER, HIGH);
+      LampoKatkaisu = 1;  // tee tästä varoitus! 
+      delay(1000);
+      Serial.println("Lampokatkaisu=1, charger HIGH");
+    }
+  
+  if (lastmillis - lampoMillis >= 15000)      
+    {
+        lampoMillis = lastmillis; 
+          if(volts1 < 3.4 && volts1 > 1.6) // 3.38=8C, 1.78=40C
+            {
+              LampoKatkaisu = 0;
+              if(akunjannite < 64)
+                {
+                  Serial.println("Akku: 48 > x < 65 ");
+                  digitalWrite(CHARGER, LOW);  // Lataa
+                }
+            
+              if(akunjannite > 64 && akku_boost == 0)
+                {
+                  digitalWrite(CHARGER, HIGH);  //sammuta lataus -> tavoite 4.0V kennojännite
+                  Serial.println("Akku_boost=0");
+                }       
+              if(akunjannite < 67 && akku_boost == 1)
+                {
+                  digitalWrite(CHARGER, LOW);  //käynnistä lataus -> tavoite 4.2V kennojännite
+                  Serial.println("alle 68V boost=1");
+                }           
+            
+            }
+    Serial.print("Akkuboost: ");        
+    Serial.println(akku_boost);
+    Serial.print("Boostsensor: ");
+    Serial.println(akkuboostsensor);
+    akkuboostsensor = akku_boost;
+    }
+
+
+
+  /* if client was disconnected then try to reconnect again */
+  if (!client.connected()) {
+      mqttconnect();
+    }
+  
+  client.loop();
+
+
+  
+  long now = millis();
+  if (now - lastMsg > 15000) 
+  {
+    lastMsg = now;
+    janniteviesti = ads.computeVolts(ads.readADC_SingleEnded(3)) * 31.8;
+    NTC_viesti = ads.computeVolts(ads.readADC_SingleEnded(2));
+    LM35_viesti = ads.computeVolts(ads.readADC_SingleEnded(0)) * 100;
+    bttpwr_viesti = Output;
+    heatsw_viesti = LampoKatkaisu;
+    boost_viesti = akku_boost; 
+    lammtot_viesti = lammitys_tot;
+    millis_viesti = millis() / 1000;
+    bsense_viesti = akkuboostsensor;
+    ki_viesti = Ki;
+    kp_viesti = Kp;
+
+
+    /*
+    Serial.print("LAmpokatkaisu-mainloop: ");
+    Serial.println(LampoKatkaisu);
+
+    Serial.print("Output-mainloop: ");
+    Serial.println(Output);
+
   Serial.print("Input: ");
   Serial.println(Input);
   
@@ -248,62 +386,6 @@ void loop()
   Serial.print("Setpoint: ");
   Serial.println(Setpoint);
   */
-
-  analogWrite(HEATER, Output);                   // vastaa analogwrite:ä, kanava ja taajuus 8 bittisenä. 
-
-   // Jos käydään lämpörajoilla, katkaistaan laturin virta. 
-  if( volts1 < 1.5 || volts1 >  3.5 )  // 3.533=5C, 1.5=47C
-    { 
-      digitalWrite(CHARGER, HIGH);
-      LampoKatkaisu = 1;
-      //Serial.println("Lampokatkaisu=1, charger LOW");
-    }
-  
-  if (LampoKatkaisu == 1 && volts1 < 3.38 && volts1 > 1.78 && lastmillis - lampoMillis >= 5000)  // 3.38=8C, 1.78=40C
-    {
-        lampoMillis = lastmillis; 
-        LampoKatkaisu = 0;
-        Serial.println("Lampokatkaisu=0");
-    }
-  if(LampoKatkaisu == 0)
-  {
-    digitalWrite(CHARGER, LOW);
-    //serial.println("Charger HIGH");
-  } 
-
-
-
-
-  //ADC_luku();
-
-  /* if client was disconnected then try to reconnect again */
-  if (!client.connected()) {
-      mqttconnect();
-    }
-  
-  client.loop();
-
-  float janniteviesti;
-  float NTC_viesti;  
-  float LM35_viesti;
-  float bttpwr_viesti;
-  float heatsw_viesti;
-
-  
-  long now = millis();
-  if (now - lastMsg > 10000) 
-  {
-    lastMsg = now;
-    janniteviesti = ads.computeVolts(ads.readADC_SingleEnded(3)) * 31.31;
-    NTC_viesti = ads.computeVolts(ads.readADC_SingleEnded(2));
-    LM35_viesti = ads.computeVolts(ads.readADC_SingleEnded(0)) * 100;
-    bttpwr_viesti = ( Output / 255 ) * 100;
-    heatsw_viesti = LampoKatkaisu;
-    Serial.print("LAmpokatkaisu-mainloop: ");
-    Serial.println(LampoKatkaisu);
-
-    Serial.print("Output-mainloop: ");
-    Serial.println(Output);
         
     if (!isnan(janniteviesti) && !isnan(NTC_viesti) && !isnan(LM35_viesti))
 
@@ -315,19 +397,16 @@ void loop()
       Serial.print("Tehot: ");
       Serial.println(bttpwr_viesti);
       
-
-      snprintf (v_msg, 8, "%f", janniteviesti);
-      snprintf (ntc_msg, 8, "%f", NTC_viesti);
-      snprintf (lm35_msg, 8, "%f", LM35_viesti);
-      snprintf (bttpwr_msg, 3, "%f", bttpwr_viesti);
-      snprintf (heatsw_msg, 2, "%f", heatsw_viesti);
-
-      Serial.print("HeatSW: ");
-      Serial.println(heatsw_msg);
-
-      Serial.print("Tehot: ");
-      Serial.println(bttpwr_msg);
-      
+      snprintf(v_msg, 8, "%f", janniteviesti);
+      snprintf(ntc_msg, 8, "%f", NTC_viesti);
+      snprintf(lm35_msg, 8, "%f", LM35_viesti);
+      snprintf(bttpwr_msg, 4, "%f", bttpwr_viesti);
+      snprintf(heatsw_msg, 4, "%f", heatsw_viesti);
+      snprintf(boostsens_msg , 4, "%f", bsense_viesti);
+      snprintf(lammtotmsg, 4, "%f", lammtot_viesti);
+      snprintf(ms_msg, 8, "%f", millis_viesti);
+      snprintf(ki_msg, 8, "%f", ki_viesti);
+      snprintf(kp_msg, 8, "%f", kp_viesti);
 
 
       /* publish the message */
@@ -336,6 +415,12 @@ void loop()
       client.publish(AKKULAMPO_LM35, lm35_msg);
       client.publish(AKKULAMPOTEHOT, bttpwr_msg);
       client.publish(LAMPOKATKAISU, heatsw_msg);
+      client.publish(UPTIMES, ms_msg);
+      client.publish(LAMMTOT, lammtotmsg);
+      client.publish(BOOSTSENSE, boostsens_msg);
+      client.publish(KP, kp_msg);
+      client.publish(KI, ki_msg);
+
       Serial.println(" ");
       //delay(100);
       }
@@ -344,6 +429,11 @@ void loop()
 //uusvanhakoodi
 
   
+  
+
+
+
+
   
 
 }
